@@ -55,3 +55,17 @@ After setting the variable, you can run the deployment with the Sepolia network:
 ```shell
 npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
 ```
+
+
+# 1) Node local
+npx hardhat node
+
+# 2) Deploy tất cả cặp + mock oracle price
+$env:NETWORK_KIND="local"
+npx hardhat run scripts/01_deploy_all.ts --network localhost
+# -> lưu lại địa chỉ OrderBook in ra
+
+# 3) Seed toàn bộ cặp
+$env:OB_ADDR="0x...OrderBookAddressFromDeploy"
+npx hardhat run scripts/02_seed_all.ts --network localhost
+
