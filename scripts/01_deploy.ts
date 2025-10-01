@@ -31,9 +31,16 @@ async function main() {
   const r2 = await (await orderbook.addPair("BTC - USD", 8, 8, 8)).wait();
   const r3 = await (await orderbook.addPair("LINK - USD", 8, 18, 8)).wait();
 
-  const ethPairId = Number(r1!.logs[0].args?.pairId || 1);
-  const btcPairId = Number(r2!.logs[0].args?.pairId || 2);
-  const linkPairId = Number(r3!.logs[0].args?.pairId || 3);
+  function getPairId(log: any, fallback: number) {
+    if ("args" in log && log.args?.pairId !== undefined) {
+      return Number(log.args.pairId);
+    }
+    return fallback;
+  }
+
+  const ethPairId = getPairId(r1!.logs[0], 1);
+  const btcPairId = getPairId(r2!.logs[0], 2);
+  const linkPairId = getPairId(r3!.logs[0], 3);
 
   console.log("Deployer:", deployer.address);
   console.log("OracleRouter:", await oracle.getAddress());
