@@ -1,16 +1,25 @@
 import { network } from "hardhat";
+import "dotenv/config";
 
-// Sides giống enum trong Solidity
+// enum giống Solidity
 enum Side { BUY, SELL }
+
+// ====== cấu hình qua env (tuỳ chọn) ======
+const N_LEVELS = Number(process.env.LEVELS ?? 10);      // số level mỗi phía
+const K_TRADES = Number(process.env.TRADES ?? 40);      // số giao dịch tạo thêm
+const STEP_BPS  = Number(process.env.STEP_BPS ?? 10);   // khoảng cách giữa các level, đơn vị bps (10 = 0.10%)
+const ONLY_SYMBOL = process.env.ONLY_SYMBOL;            // seed riêng 1 symbol nếu set
 
 // scale helpers
 const P = (x: number, priceDec = 8) => {
-  // giữ 8 mặc định trừ khi pair dùng priceDecimals khác
   const mul = 10 ** priceDec;
   return BigInt(Math.round(x * mul));
 };
 const A = (ethers: any, x: number, baseDec: number) =>
   ethers.parseUnits(x.toString(), baseDec);
+
+// random helper
+const rnd = (min: number, max: number) => min + Math.random() * (max - min);
 
 async function main() {
   const { ethers } = await network.connect();
@@ -20,17 +29,12 @@ async function main() {
 
   const ob = await ethers.getContractAt("OnchainOrderBook", obAddr);
 
-  // Lấy địa chỉ OracleRouter từ biến public "oracle" của orderbook
+  // Oracle
   const oracleAddr = await ob.oracle();
   const oracle = await ethers.getContractAt("OracleRouter", oracleAddr);
 
-  const signers = await ethers.getSigners();
-  // dùng 3 signer khác nhau để tạo maker/taker tự nhiên
-  const sA = signers[0];
-  const sB = signers[1];
-  const sC = signers[2];
+  const [sA, sB, sC] = await ethers.getSigners();
 
-  // Xác định số lượng cặp đã được addPair
   const nextPairId = await ob.nextPairId();
   const totalPairs = Number(nextPairId) - 1;
   if (totalPairs <= 0) {
@@ -38,68 +42,65 @@ async function main() {
     return;
   }
 
-  console.log(`Seeding ${totalPairs} pairs...`);
+  console.log(`Deep seeding ${totalPairs} pairs... (LEVELS=${N_LEVELS}, TRADES=${K_TRADES}, STEP_BPS=${STEP_BPS})`);
 
   for (let pairId = 1; pairId <= totalPairs; pairId++) {
-    // 1) Lấy meta
-    const meta = await ob.getPairMeta(pairId);
-    const symbol = meta[0] as string;
-    const priceDecimals = Number(meta[1]);
-    const baseDecimals  = Number(meta[2]); // dùng cho amount
-    // const quoteDecimals = Number(meta[3]); // chỉ metadata hiển thị
+    // 1) Meta
+    const [symbol, priceDecBN, baseDecBN] = await ob.getPairMeta(pairId);
+    if (ONLY_SYMBOL && symbol !== ONLY_SYMBOL) {
+      continue; // bỏ qua nếu user chỉ muốn 1 symbol
+    }
+    const priceDecimals = Number(priceDecBN);
+    const baseDecimals  = Number(baseDecBN);
 
-    // 2) Lấy mark price từ oracle
+    // 2) Mark price từ oracle
     const [answer, feedDec /*, updatedAt*/] = await oracle.getLatestPrice(symbol);
     const mark = Number(answer) / 10 ** Number(feedDec);
-
-    // Nếu mark price <= 0 (hiếm khi), đặt mark 10 cho an toàn
     const markSafe = mark > 0 ? mark : 10;
 
-    // 3) Tạo các mức giá quanh mark (ví dụ ±1%, ±0.5%)
-    const pxBid1 = markSafe * 0.99;
-    const pxBid2 = markSafe * 0.995;
-    const pxAsk1 = markSafe * 1.005;
-    const pxAsk2 = markSafe * 1.01;
+    // 3) Tạo N level mỗi phía
+    for (let i = 1; i <= N_LEVELS; i++) {
+      const delta = (STEP_BPS * i) / 10_000;     // ví dụ 10 bps = 0.001
+      const bidPx = markSafe * (1 - delta);
+      const askPx = markSafe * (1 + delta);
 
-    // 4) Khối lượng demo (tuỳ theo baseDecimals)
-    //    - token 18 decimals: vài đơn vị
-    //    - token 6/8 decimals: vài tens/hundreds để nhìn rõ
-    const sizeBig   = baseDecimals >= 18 ? 1.2 : 120;  // maker lớn
-    const sizeMid   = baseDecimals >= 18 ? 0.8 : 80;   // maker vừa
-    const sizeSmall = baseDecimals >= 18 ? 0.5 : 50;   // taker nhỏ để cross
+      // size ngẫu nhiên một chút cho đẹp, tuỳ theo decimals
+      const szBid = baseDecimals >= 18 ? rnd(0.3, 1.6) : rnd(30, 160);
+      const szAsk = baseDecimals >= 18 ? rnd(0.3, 1.6) : rnd(30, 160);
 
-    // 5) Đặt lệnh:
-    //   - Tạo 2 mức BID & 2 mức ASK
-    //   - Sau đó đặt 1 lệnh TAKer để cross @best ask (đối với BUY) giúp sinh trade
-    //   - Lặp lại mô hình cho mỗi pair
+      const makerB = i % 2 ? sA : sB;
+      const makerS = i % 2 ? sB : sA;
 
-    // BIDs
-    await (await ob.connect(sA).placeLimitOrder(
-      pairId, Side.BUY, P(pxBid1, priceDecimals), A(ethers, sizeBig, baseDecimals)
-    )).wait();
+      await (await ob.connect(makerB).placeLimitOrder(
+        pairId, Side.BUY,  P(bidPx, priceDecimals), A(ethers, szBid, baseDecimals)
+      )).wait();
 
-    await (await ob.connect(sB).placeLimitOrder(
-      pairId, Side.BUY, P(pxBid2, priceDecimals), A(ethers, sizeMid, baseDecimals)
-    )).wait();
+      await (await ob.connect(makerS).placeLimitOrder(
+        pairId, Side.SELL, P(askPx, priceDecimals), A(ethers, szAsk, baseDecimals)
+      )).wait();
+    }
 
-    // ASKs
-    await (await ob.connect(sA).placeLimitOrder(
-      pairId, Side.SELL, P(pxAsk1, priceDecimals), A(ethers, sizeBig, baseDecimals)
-    )).wait();
+    // 4) Bơm K giao dịch ngẫu nhiên (BUY/SELL) để có nhiều recent trades
+    //    Dùng giá chạm best đối ứng (mark ± epsilon) để chắc chắn cross
+    const EPS = 0.0002; // 2 bps
+    for (let k = 0; k < K_TRADES; k++) {
+      const takerSide = Math.random() < 0.5 ? Side.BUY : Side.SELL;
+      const px = takerSide === Side.BUY
+        ? markSafe * (1 + EPS)   // BUY: >= best ask
+        : markSafe * (1 - EPS);  // SELL: <= best bid
 
-    await (await ob.connect(sB).placeLimitOrder(
-      pairId, Side.SELL, P(pxAsk2, priceDecimals), A(ethers, sizeMid, baseDecimals)
-    )).wait();
+      const amt = baseDecimals >= 18 ? rnd(0.10, 0.70) : rnd(10, 70);
+      const who = k % 3 === 0 ? sC : (k % 3 === 1 ? sA : sB);
 
-    // TAKER BUY @ best ask (pxAsk1) để tạo ít nhất 1 trade
-    await (await ob.connect(sC).placeLimitOrder(
-      pairId, Side.BUY, P(pxAsk1, priceDecimals), A(ethers, sizeSmall, baseDecimals)
-    )).wait();
+      await (await ob.connect(who).placeLimitOrder(
+        pairId, takerSide, P(px, priceDecimals), A(ethers, amt, baseDecimals)
+      )).wait();
+    }
 
-    console.log(`[OK] Seeded pair #${pairId} (${symbol}) @ mark≈${markSafe.toFixed(6)}`);
+    console.log(`[OK+] Deep seeded #${pairId} (${symbol}) @ mark≈${markSafe.toFixed(6)}`);
   }
 
-  console.log("===> Done. Tất cả cặp đã có Orderbook + ít nhất 1 Recent Trade.");
+  console.log("===> Done. Orderbook dày hơn + nhiều recent trades.");
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
