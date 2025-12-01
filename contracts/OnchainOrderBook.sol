@@ -3,6 +3,11 @@ pragma solidity ^0.8.20;
 
 import "./OracleRouter.sol";
 
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
+}
+
 /* ========== Library: FixedPoint helpers ========== */
 library FP {
     uint256 internal constant WAD = 1e18;
@@ -22,11 +27,17 @@ contract OnchainOrderBook {
 
     struct Pair {
         string symbol;         // ví dụ: "ETH - USD"
-        uint8 priceDecimals;   // ví dụ 8 = price * 1e8
+        uint8 priceDecimals;   // ví dụ 18 = price * 1e18
         uint8 baseDecimals;    // decimals tài sản cơ sở
         uint8 quoteDecimals;   // decimals tài sản định giá
+        IERC20 baseToken;
+        IERC20 quoteToken;
         bool exists;
     }
+
+    // user balances per pair (vault đơn giản)
+    mapping(uint256 => mapping(address => uint256)) public baseBalances;   // pairId => user => base
+    mapping(uint256 => mapping(address => uint256)) public quoteBalances;  // pairId => user => quote
 
     struct Order {
         uint256 id;
@@ -37,7 +48,10 @@ contract OnchainOrderBook {
         uint256 remaining; // base amount còn lại
         uint256 timestamp;
         bool active;
+        uint256 lockedBase;   // chỉ dùng cho SELL
+        uint256 lockedQuote;  // chỉ dùng cho BUY
     }
+
 
     struct Trade {
         uint256 ts;
@@ -90,6 +104,12 @@ contract OnchainOrderBook {
     event OrderCanceled(uint256 indexed pairId, uint256 indexed orderId);
     event TradeExecuted(uint256 indexed pairId, uint256 price, uint256 amount, address maker, address taker, Side takerSide);
 
+    event BaseDeposited(uint256 indexed pairId, address indexed user, uint256 amount);
+    event QuoteDeposited(uint256 indexed pairId, address indexed user, uint256 amount);
+    event BaseWithdrawn(uint256 indexed pairId, address indexed user, uint256 amount);
+    event QuoteWithdrawn(uint256 indexed pairId, address indexed user, uint256 amount);
+
+
     constructor(address _oracleRouter) {
         oracle = OracleRouter(_oracleRouter);
     }
@@ -99,18 +119,26 @@ contract OnchainOrderBook {
         string calldata symbol,
         uint8 priceDecimals,
         uint8 baseDecimals,
-        uint8 quoteDecimals
+        uint8 quoteDecimals,
+        address baseToken,
+        address quoteToken
     ) external returns (uint256 pairId) {
+        require(baseToken != address(0) && quoteToken != address(0), "zero addr");
+
         pairId = nextPairId++;
         pairs[pairId] = Pair({
             symbol: symbol,
             priceDecimals: priceDecimals,
             baseDecimals: baseDecimals,
             quoteDecimals: quoteDecimals,
+            baseToken: IERC20(baseToken),
+            quoteToken: IERC20(quoteToken),
             exists: true
         });
+
         emit PairAdded(pairId, symbol, priceDecimals, baseDecimals, quoteDecimals);
     }
+
 
     /* ===== Helpers for price arrays ===== */
     function _insertBidPrice(uint256 pairId, uint256 price) internal {
@@ -167,6 +195,24 @@ contract OnchainOrderBook {
         require(pairs[pairId].exists, "pair not found");
         require(price > 0 && amount > 0, "invalid params");
 
+        Pair storage pair = pairs[pairId];
+
+        uint256 lockedBase;
+        uint256 lockedQuote;
+
+        if (side == Side.BUY) {
+            // Cần khóa tối đa quote = price * amount
+            uint256 costQuote = _quoteAmount(price, amount);
+            require(quoteBalances[pairId][msg.sender] >= costQuote, "insuff quote");
+            quoteBalances[pairId][msg.sender] -= costQuote;
+            lockedQuote = costQuote;
+        } else {
+            // SELL: khóa base amount
+            require(baseBalances[pairId][msg.sender] >= amount, "insuff base");
+            baseBalances[pairId][msg.sender] -= amount;
+            lockedBase = amount;
+        }
+
         orderId = nextOrderId++;
         orders[orderId] = Order({
             id: orderId,
@@ -176,7 +222,9 @@ contract OnchainOrderBook {
             amount: amount,
             remaining: amount,
             timestamp: block.timestamp,
-            active: true
+            active: true,
+            lockedBase: lockedBase,
+            lockedQuote: lockedQuote
         });
         emit OrderPlaced(pairId, orderId, msg.sender, side, price, amount);
 
@@ -207,10 +255,12 @@ contract OnchainOrderBook {
         }
     }
 
+
     function cancelOrder(uint256 pairId, uint256 orderId) external {
         Order storage o = orders[orderId];
         require(o.active, "not active");
         require(o.trader == msg.sender, "not owner");
+
         o.active = false;
 
         if (o.side == Side.BUY) {
@@ -220,9 +270,14 @@ contract OnchainOrderBook {
             uint256 lvl2 = askLevels[pairId][o.price];
             if (lvl2 >= o.remaining) askLevels[pairId][o.price] = lvl2 - o.remaining;
         }
+
+        // refund phần locked còn lại (base / quote)
+        _refundLocked(pairId, o);
+
         emit OrderCanceled(pairId, orderId);
         _cleanupTop(pairId);
     }
+
 
     function _matchAtPrice(uint256 pairId, uint256 takerId, Side takerSide, uint256 priceLevel) internal {
         Order storage taker = orders[takerId];
@@ -230,6 +285,7 @@ contract OnchainOrderBook {
 
         uint256[] storage q = (takerSide == Side.BUY) ? askQueues[pairId][priceLevel] : bidQueues[pairId][priceLevel];
 
+        Pair storage pair = pairs[pairId];
         uint256 idx = 0;
         while (taker.active && idx < q.length) {
             uint256 makerId = q[idx];
@@ -238,14 +294,67 @@ contract OnchainOrderBook {
 
             uint256 fill = taker.remaining < maker.remaining ? taker.remaining : maker.remaining;
 
-            // Cập nhật số lượng
+            // Cập nhật remaining
             taker.remaining -= fill;
             maker.remaining -= fill;
 
-            // Cập nhật level tổng
+            // Giá khớp = priceLevel
+            uint256 tradePrice = priceLevel;
+            uint256 quoteAtTrade = _quoteAmount(tradePrice, fill);
+
+            // Buyer / Seller & xử lý price improvement
             if (takerSide == Side.BUY) {
+                // taker = BUY, maker = SELL
+                Order storage buyOrder = taker;
+                Order storage sellOrder = maker;
+
+                uint256 quoteAtLimit = _quoteAmount(buyOrder.price, fill);
+                require(buyOrder.lockedQuote >= quoteAtLimit, "BUY: lockedQuote underflow");
+
+                // giảm locked theo limit price
+                buyOrder.lockedQuote -= quoteAtLimit;
+
+                // seller nhận quote theo giá trade
+                quoteBalances[pairId][sellOrder.trader] += quoteAtTrade;
+
+                // refund cho buyer nếu có price improvement
+                if (quoteAtLimit > quoteAtTrade) {
+                    uint256 refund = quoteAtLimit - quoteAtTrade;
+                    quoteBalances[pairId][buyOrder.trader] += refund;
+                }
+
+                // base: từ seller sang buyer
+                require(sellOrder.lockedBase >= fill, "SELL: lockedBase underflow");
+                sellOrder.lockedBase -= fill;
+                baseBalances[pairId][buyOrder.trader] += fill;
+
+                // Update tổng level
                 askLevels[pairId][priceLevel] -= fill;
             } else {
+                // taker = SELL, maker = BUY
+                Order storage sellOrder = taker;
+                Order storage buyOrder = maker;
+
+                uint256 quoteAtLimit = _quoteAmount(buyOrder.price, fill);
+                require(buyOrder.lockedQuote >= quoteAtLimit, "BUY: lockedQuote underflow");
+
+                buyOrder.lockedQuote -= quoteAtLimit;
+
+                // seller nhận quote theo giá trade
+                quoteBalances[pairId][sellOrder.trader] += quoteAtTrade;
+
+                // refund cho buyer nếu giá trade < limit (thực tế thường =)
+                if (quoteAtLimit > quoteAtTrade) {
+                    uint256 refund = quoteAtLimit - quoteAtTrade;
+                    quoteBalances[pairId][buyOrder.trader] += refund;
+                }
+
+                // base: từ seller sang buyer
+                require(sellOrder.lockedBase >= fill, "SELL: lockedBase underflow");
+                sellOrder.lockedBase -= fill;
+                baseBalances[pairId][buyOrder.trader] += fill;
+
+                // Update tổng level
                 bidLevels[pairId][priceLevel] -= fill;
             }
 
@@ -256,12 +365,15 @@ contract OnchainOrderBook {
             if (maker.remaining == 0) {
                 maker.active = false;
                 emit OrderFilled(pairId, makerId);
+                _refundLocked(pairId, maker);
             }
             if (taker.remaining == 0) {
                 taker.active = false;
                 emit OrderFilled(pairId, takerId);
+                _refundLocked(pairId, taker);
             }
         }
+
 
         // Nén queue (bỏ phần tử đầu đã xử lý)
         if (idx > 0) {
@@ -298,6 +410,18 @@ contract OnchainOrderBook {
 
         emit TradeExecuted(pairId, price, amount, maker, taker, takerSide);
     }
+
+    function _refundLocked(uint256 pairId, Order storage o) internal {
+        if (o.lockedBase > 0) {
+            baseBalances[pairId][o.trader] += o.lockedBase;
+            o.lockedBase = 0;
+        }
+        if (o.lockedQuote > 0) {
+            quoteBalances[pairId][o.trader] += o.lockedQuote;
+            o.lockedQuote = 0;
+        }
+    }
+
 
     /* ===== Views for frontend ===== */
 
@@ -381,5 +505,69 @@ contract OnchainOrderBook {
             askSz = askLevels[pairId][askPx];
             hasAsk = askSz > 0;
         }
+    }
+
+    /* ===== Vault: deposit / withdraw ===== */
+
+    function depositBase(uint256 pairId, uint256 amount) external {
+        Pair storage p = pairs[pairId];
+        require(p.exists, "pair not found");
+        require(amount > 0, "amount=0");
+
+        require(p.baseToken.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        baseBalances[pairId][msg.sender] += amount;
+
+        emit BaseDeposited(pairId, msg.sender, amount);
+    }
+
+    function depositQuote(uint256 pairId, uint256 amount) external {
+        Pair storage p = pairs[pairId];
+        require(p.exists, "pair not found");
+        require(amount > 0, "amount=0");
+
+        require(p.quoteToken.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        quoteBalances[pairId][msg.sender] += amount;
+
+        emit QuoteDeposited(pairId, msg.sender, amount);
+    }
+
+    function withdrawBase(uint256 pairId, uint256 amount) external {
+        Pair storage p = pairs[pairId];
+        require(p.exists, "pair not found");
+        require(amount > 0, "amount=0");
+        require(baseBalances[pairId][msg.sender] >= amount, "insuff base");
+
+        baseBalances[pairId][msg.sender] -= amount;
+        require(p.baseToken.transfer(msg.sender, amount), "transfer failed");
+
+        emit BaseWithdrawn(pairId, msg.sender, amount);
+    }
+
+    function withdrawQuote(uint256 pairId, uint256 amount) external {
+        Pair storage p = pairs[pairId];
+        require(p.exists, "pair not found");
+        require(amount > 0, "amount=0");
+        require(quoteBalances[pairId][msg.sender] >= amount, "insuff quote");
+
+        quoteBalances[pairId][msg.sender] -= amount;
+        require(p.quoteToken.transfer(msg.sender, amount), "transfer failed");
+
+        emit QuoteWithdrawn(pairId, msg.sender, amount);
+    }
+
+    function _quoteAmount(uint256 price, uint256 baseAmount) internal pure returns (uint256) {
+        // Giả sử price & baseAmount cùng scale 1e18 (WAD)
+        // quote = price * baseAmount / 1e18
+        return price.mulWad(baseAmount);
+    }
+
+    function getPairTokens(uint256 pairId)
+    external
+    view
+    returns (address baseToken, address quoteToken)
+    {
+        Pair memory p = pairs[pairId];
+        require(p.exists, "pair not found");
+        return (address(p.baseToken), address(p.quoteToken));
     }
 }

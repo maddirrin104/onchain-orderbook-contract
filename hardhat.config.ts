@@ -7,19 +7,13 @@ import { configVariable } from "hardhat/config";
 const config: HardhatUserConfig = {
   plugins: [hardhatToolboxMochaEthersPlugin, hardhatEthers],
   solidity: {
-    profiles: {
-      default: {
-        version: "0.8.28",
+    version: "0.8.20",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200,
       },
-      production: {
-        version: "0.8.28",
-        settings: {
-          optimizer: {
-            enabled: true,
-            runs: 200,
-          },
-        },
-      },
+      viaIR: true,
     },
   },
   networks: {
@@ -41,7 +35,6 @@ const config: HardhatUserConfig = {
       type: "http", 
       url: "http://127.0.0.1:8545",
       chainId: 31337,
-      // accounts: [configVariable("PRIVATE_KEY")], // optional: chỉ bật khi bạn thực sự đặt PRIVATE_KEY 
     },
   },
   paths: {
@@ -53,3 +46,4 @@ const config: HardhatUserConfig = {
 };
 
 export default config;
+

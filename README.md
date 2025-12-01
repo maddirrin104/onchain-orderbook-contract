@@ -58,14 +58,25 @@ npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
 
 
 # 1) Node local
+```bash
 npx hardhat node
+```
 
 # 2) Deploy tất cả cặp + mock oracle price
 $env:NETWORK_KIND="local"
+
+```bash
 npx hardhat run scripts/01_deploy_all.ts --network localhost
-# -> lưu lại địa chỉ OrderBook in ra
+```
+ lưu lại địa chỉ OrderBook in ra
 
 # 3) Seed toàn bộ cặp
 $env:OB_ADDR="0x...OrderBookAddressFromDeploy"
+```bash
 npx hardhat run scripts/02_seed_all.ts --network localhost
+npx hardhat run scripts/03_seed_all.ts --network localhost
+```
 
+# Repo tham khảo
+https://github.com/cjxe/on-chain-dex?tab=readme-ov-file
+https://github.com/hord/hord-orderbook-dex-contracts

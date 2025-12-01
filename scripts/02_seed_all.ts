@@ -1,22 +1,21 @@
 import { network } from "hardhat";
 import "dotenv/config";
 
-// enum giống Solidity
 enum Side { BUY, SELL }
 
-// ====== cấu hình qua env (tuỳ chọn) ======
-const N_LEVELS = Number(process.env.LEVELS ?? 10);      // số level mỗi phía
-const K_TRADES = Number(process.env.TRADES ?? 40);      // số giao dịch tạo thêm
-const STEP_BPS  = Number(process.env.STEP_BPS ?? 10);   // khoảng cách giữa các level, đơn vị bps (10 = 0.10%)
-const ONLY_SYMBOL = process.env.ONLY_SYMBOL;            // seed riêng 1 symbol nếu set
+const N_LEVELS = Number(process.env.LEVELS ?? 10);
+const K_TRADES = Number(process.env.TRADES ?? 40);
+const STEP_BPS  = Number(process.env.STEP_BPS ?? 10);
+const ONLY_SYMBOL = process.env.ONLY_SYMBOL;
 
-// scale helpers
 const P = (x: number, priceDec = 8) => {
   const mul = 10 ** priceDec;
   return BigInt(Math.round(x * mul));
 };
 const A = (ethers: any, x: number, baseDec: number) =>
   ethers.parseUnits(x.toString(), baseDec);
+const Q = (ethers: any, x: number, quoteDec: number) =>
+  ethers.parseUnits(x.toString(), quoteDec);
 
 // random helper
 const rnd = (min: number, max: number) => min + Math.random() * (max - min);
@@ -25,11 +24,9 @@ async function main() {
   const { ethers } = await network.connect();
 
   const obAddr = process.env.OB_ADDR as `0x${string}`;
-  if (!obAddr) throw new Error("Missing OB_ADDR (địa chỉ OnchainOrderBook)");
+  if (!obAddr) throw new Error("Missing OB_ADDR");
 
   const ob = await ethers.getContractAt("OnchainOrderBook", obAddr);
-
-  // Oracle
   const oracleAddr = await ob.oracle();
   const oracle = await ethers.getContractAt("OracleRouter", oracleAddr);
 
@@ -46,25 +43,45 @@ async function main() {
 
   for (let pairId = 1; pairId <= totalPairs; pairId++) {
     // 1) Meta
-    const [symbol, priceDecBN, baseDecBN] = await ob.getPairMeta(pairId);
-    if (ONLY_SYMBOL && symbol !== ONLY_SYMBOL) {
-      continue; // bỏ qua nếu user chỉ muốn 1 symbol
-    }
+    const [symbol, priceDecBN, baseDecBN, quoteDecBN] = await ob.getPairMeta(pairId);
+    if (ONLY_SYMBOL && symbol !== ONLY_SYMBOL) continue;
+
     const priceDecimals = Number(priceDecBN);
     const baseDecimals  = Number(baseDecBN);
+    const quoteDecimals = Number(quoteDecBN);
 
-    // 2) Mark price từ oracle
-    const [answer, feedDec /*, updatedAt*/] = await oracle.getLatestPrice(symbol);
+    // 1.1) Lấy token address
+    const [baseTokenAddr, quoteTokenAddr] = await (ob as any).getPairTokens(pairId);
+    const baseToken  = await ethers.getContractAt("MockERC20", baseTokenAddr);
+    const quoteToken = await ethers.getContractAt("MockERC20", quoteTokenAddr);
+
+    // 2) Mark price
+    const [answer, feedDec] = await oracle.getLatestPrice(symbol);
     const mark = Number(answer) / 10 ** Number(feedDec);
     const markSafe = mark > 0 ? mark : 10;
 
-    // 3) Tạo N level mỗi phía
+    // 2.1) Mint + approve + deposit cho 3 signer (1 lần/pair)
+    const signers = [sA, sB, sC];
+    for (const s of signers) {
+      // base: ví dụ 10_000 đơn vị
+      const baseDep = A(ethers, 10_000, baseDecimals);
+      await (await baseToken.connect(s).mint(s.address, baseDep)).wait();
+      await (await baseToken.connect(s).approve(obAddr, baseDep)).wait();
+      await (await (ob as any).connect(s).depositBase(pairId, baseDep)).wait();
+
+      // quote: khoảng 10_000 * mark * 2 cho dư
+      const quoteDep = Q(ethers, 10_000 * markSafe * 2, quoteDecimals);
+      await (await quoteToken.connect(s).mint(s.address, quoteDep)).wait();
+      await (await quoteToken.connect(s).approve(obAddr, quoteDep)).wait();
+      await (await (ob as any).connect(s).depositQuote(pairId, quoteDep)).wait();
+    }
+
+    // 3) Tạo N level mỗi phía (phần cũ giữ nguyên)
     for (let i = 1; i <= N_LEVELS; i++) {
-      const delta = (STEP_BPS * i) / 10_000;     // ví dụ 10 bps = 0.001
+      const delta = (STEP_BPS * i) / 10_000;
       const bidPx = markSafe * (1 - delta);
       const askPx = markSafe * (1 + delta);
 
-      // size ngẫu nhiên một chút cho đẹp, tuỳ theo decimals
       const szBid = baseDecimals >= 18 ? rnd(0.3, 1.6) : rnd(30, 160);
       const szAsk = baseDecimals >= 18 ? rnd(0.3, 1.6) : rnd(30, 160);
 
@@ -80,14 +97,13 @@ async function main() {
       )).wait();
     }
 
-    // 4) Bơm K giao dịch ngẫu nhiên (BUY/SELL) để có nhiều recent trades
-    //    Dùng giá chạm best đối ứng (mark ± epsilon) để chắc chắn cross
-    const EPS = 0.0002; // 2 bps
+    // 4) Bơm K giao dịch cross
+    const EPS = 0.0002;
     for (let k = 0; k < K_TRADES; k++) {
       const takerSide = Math.random() < 0.5 ? Side.BUY : Side.SELL;
       const px = takerSide === Side.BUY
-        ? markSafe * (1 + EPS)   // BUY: >= best ask
-        : markSafe * (1 - EPS);  // SELL: <= best bid
+        ? markSafe * (1 + EPS)
+        : markSafe * (1 - EPS);
 
       const amt = baseDecimals >= 18 ? rnd(0.10, 0.70) : rnd(10, 70);
       const who = k % 3 === 0 ? sC : (k % 3 === 1 ? sA : sB);
