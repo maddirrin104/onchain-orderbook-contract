@@ -13,11 +13,18 @@ const P = (x: number, priceDec = 8) => {
   return BigInt(Math.round(x * mul));
 };
 
+const toUnits = (ethers: any, x: number, decimals: number) => {
+  const frac = Math.min(decimals, 6);
+  const s = x.toFixed(frac);
+  return ethers.parseUnits(s, decimals);
+};
+
 const A = (ethers: any, x: number, baseDec: number) =>
-  ethers.parseUnits(x.toString(), baseDec);
+  toUnits(ethers, x, baseDec);
 
 const Q = (ethers: any, x: number, quoteDec: number) =>
-  ethers.parseUnits(x.toString(), quoteDec);
+  toUnits(ethers, x, quoteDec);
+
 
 async function main() {
   const { ethers } = await network.connect();

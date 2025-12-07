@@ -1,3 +1,4 @@
+// scripts/01_deploy_all.ts
 import { network } from "hardhat";
 import { FEEDS_SEPOLIA } from "../feeds.js";
 import { BASE_DEC, baseOf, PRICE_DEC, QUOTE_DEC } from "../decimals.js";
@@ -9,10 +10,13 @@ async function main() {
 
   const [deployer] = await ethers.getSigners();
 
+  /* ========== Deploy OracleRouter (NEW constructor) ========== */
   const OracleRouter = await ethers.getContractFactory("OracleRouter");
-  const oracle = await OracleRouter.deploy();
+  // 👇 phải truyền owner
+  const oracle = await OracleRouter.deploy(deployer.address);
   await oracle.waitForDeployment();
 
+  /* ========== Deploy OnchainOrderBook ========== */
   const OnchainOrderBook = await ethers.getContractFactory("OnchainOrderBook");
   const ob = await OnchainOrderBook.deploy(await oracle.getAddress());
   await ob.waitForDeployment();
@@ -21,10 +25,9 @@ async function main() {
   console.log("OracleRouter:", await oracle.getAddress());
   console.log("OrderBook   :", await ob.getAddress());
 
-  // Mock price feed (đã có)
-  const MockAgg = KIND === "local"
-    ? await ethers.getContractFactory("MockAggregatorV3")
-    : null;
+  // Mock price feed (local mới dùng)
+  const MockAgg =
+    KIND === "local" ? await ethers.getContractFactory("MockAggregatorV3") : null;
 
   // Mock ERC20 cho test
   const MockERC20 = await ethers.getContractFactory("MockERC20");
@@ -35,10 +38,10 @@ async function main() {
   console.log("Quote token :", await quoteToken.getAddress());
 
   for (const f of FEEDS_SEPOLIA) {
-    const base = baseOf(f.symbol);             // ví dụ "ETH", "BTC"
+    const base = baseOf(f.symbol); // ví dụ "ETH", "BTC"
     const baseDec = BASE_DEC[base] ?? 18;
 
-    // 1) Deploy base token riêng cho từng base symbol (cho đẹp; hoặc tái dùng 1 token cũng được)
+    // 1) Deploy base token riêng cho từng base symbol (cho đẹp)
     const baseToken = await MockERC20.deploy(`Mock ${base}`, `m${base}`, baseDec);
     await baseToken.waitForDeployment();
 
@@ -47,7 +50,7 @@ async function main() {
 
     console.log(`Pair ${f.symbol}: base=${baseAddr}, quote=${quoteAddr}`);
 
-    // 2) Đăng ký cặp (chú ý add thêm baseToken, quoteToken)
+    // 2) Đăng ký cặp
     await (
       await (ob as any).addPair(
         f.symbol,
@@ -55,23 +58,30 @@ async function main() {
         baseDec,
         QUOTE_DEC,
         baseAddr,
-        quoteAddr,
+        quoteAddr
       )
     ).wait();
 
-
     // 3) Gắn oracle feed
     if (KIND === "local") {
-      const P = (x: number) => BigInt(Math.round(x * 1e8)); // vẫn priceDecimals=8
+      const P = (x: number) => BigInt(Math.round(x * 1e8)); // priceDecimals=8
 
       const initial =
-        base === "ETH" ? 2600 :
-        base === "BTC" ? 65000 :
-        base === "LINK" ? 14.25 :
-        base === "XAU" ? 2400 :
-        base === "EUR" ? 1.07 :
-        base === "JPY" ? 0.0067 :
-        (["USDC","DAI","USDE","USDL","PYUSD"].includes(base) ? 1.0 : 10.0);
+        base === "ETH"
+          ? 2600
+          : base === "BTC"
+          ? 65000
+          : base === "LINK"
+          ? 14.25
+          : base === "XAU"
+          ? 2400
+          : base === "EUR"
+          ? 1.07
+          : base === "JPY"
+          ? 0.0067
+          : ["USDC", "DAI", "USDE", "USDL", "PYUSD"].includes(base)
+          ? 1.0
+          : 10.0;
 
       const mock = await (MockAgg as any).deploy(8, P(initial));
       await mock.waitForDeployment();
@@ -82,5 +92,12 @@ async function main() {
   }
 
   console.log("All pairs wired for:", KIND);
+  console.log("\n== Gợi ý env cho các script seed ==");
+  console.log(`$env:OB_ADDR="${await ob.getAddress()}"`);
+  console.log(`$env:ORACLE_ADDR="${await oracle.getAddress()}"`);
 }
-main().catch(e => { console.error(e); process.exit(1); });
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

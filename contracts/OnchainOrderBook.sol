@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "./OracleRouter.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
@@ -20,7 +21,7 @@ library FP {
 }
 
 /* ========== Core DEX with on-chain orderbook ========== */
-contract OnchainOrderBook {
+contract OnchainOrderBook is ReentrancyGuard {
     using FP for uint256;
 
     enum Side { BUY, SELL }
@@ -39,8 +40,9 @@ contract OnchainOrderBook {
     mapping(uint256 => mapping(address => uint256)) public baseBalances;   // pairId => user => base
     mapping(uint256 => mapping(address => uint256)) public quoteBalances;  // pairId => user => quote
 
-    struct Order {
+    struct Order {  
         uint256 id;
+        uint256 pairId;
         address trader;
         Side side;
         uint256 price;     // scaled by priceDecimals
@@ -216,6 +218,7 @@ contract OnchainOrderBook {
         orderId = nextOrderId++;
         orders[orderId] = Order({
             id: orderId,
+            pairId: pairId,
             trader: msg.sender,
             side: side,
             price: price,
@@ -255,9 +258,9 @@ contract OnchainOrderBook {
         }
     }
 
-
     function cancelOrder(uint256 pairId, uint256 orderId) external {
         Order storage o = orders[orderId];
+        require(o.pairId == pairId, "wrong pair");
         require(o.active, "not active");
         require(o.trader == msg.sender, "not owner");
 
@@ -509,7 +512,7 @@ contract OnchainOrderBook {
 
     /* ===== Vault: deposit / withdraw ===== */
 
-    function depositBase(uint256 pairId, uint256 amount) external {
+    function depositBase(uint256 pairId, uint256 amount) external nonReentrant {
         Pair storage p = pairs[pairId];
         require(p.exists, "pair not found");
         require(amount > 0, "amount=0");
@@ -520,7 +523,7 @@ contract OnchainOrderBook {
         emit BaseDeposited(pairId, msg.sender, amount);
     }
 
-    function depositQuote(uint256 pairId, uint256 amount) external {
+    function depositQuote(uint256 pairId, uint256 amount) external nonReentrant {
         Pair storage p = pairs[pairId];
         require(p.exists, "pair not found");
         require(amount > 0, "amount=0");
@@ -531,7 +534,7 @@ contract OnchainOrderBook {
         emit QuoteDeposited(pairId, msg.sender, amount);
     }
 
-    function withdrawBase(uint256 pairId, uint256 amount) external {
+    function withdrawBase(uint256 pairId, uint256 amount) external nonReentrant {
         Pair storage p = pairs[pairId];
         require(p.exists, "pair not found");
         require(amount > 0, "amount=0");
@@ -543,7 +546,7 @@ contract OnchainOrderBook {
         emit BaseWithdrawn(pairId, msg.sender, amount);
     }
 
-    function withdrawQuote(uint256 pairId, uint256 amount) external {
+    function withdrawQuote(uint256 pairId, uint256 amount) external nonReentrant {
         Pair storage p = pairs[pairId];
         require(p.exists, "pair not found");
         require(amount > 0, "amount=0");

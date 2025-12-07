@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
+import "@openzeppelin/contracts/access/Ownable.sol";
 
 /* ========== Chainlink minimal interface ========== */
 interface AggregatorV3Interface {
@@ -11,18 +12,21 @@ interface AggregatorV3Interface {
 }
 
 /* ========== Oracle router: map symbol => feed ========== */
-contract OracleRouter {
+contract OracleRouter is Ownable {
+    constructor(address initialOwner) Ownable(initialOwner) {
+    }
+
     struct FeedInfo {
         bool exists;
         address feed;
     }
 
     // key = keccak256(abi.encodePacked(symbol))
-    mapping(bytes32 => FeedInfo) public feeds;
+    mapping(bytes32 => FeedInfo) private feeds;
 
     event FeedSet(string symbol, address feed);
 
-    function setFeed(string calldata symbol, address feed) external {
+    function setFeed(string calldata symbol, address feed) external onlyOwner {
         require(feed != address(0), "invalid feed");
         bytes32 key = keccak256(abi.encodePacked(symbol));
         feeds[key] = FeedInfo({exists: true, feed: feed});

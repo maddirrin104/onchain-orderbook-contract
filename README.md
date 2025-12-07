@@ -63,18 +63,25 @@ npx hardhat node
 ```
 
 # 2) Deploy tất cả cặp + mock oracle price
-$env:NETWORK_KIND="local"
-
+> $env:NETWORK_KIND="local"
 ```bash
 npx hardhat run scripts/01_deploy_all.ts --network localhost
 ```
  lưu lại địa chỉ OrderBook in ra
 
 # 3) Seed toàn bộ cặp
-$env:OB_ADDR="0x...OrderBookAddressFromDeploy"
+> $env:OB_ADDR="0x...OrderBookAddressFromDeploy"
 ```bash
 npx hardhat run scripts/02_seed_all.ts --network localhost
 npx hardhat run scripts/03_seed_all.ts --network localhost
+```
+# 4) Measure gas
+```bash
+npx hardhat run scripts/04_measure_gas.ts --network localhost
+```
+# 5)Scalability
+```bash
+npx hardhat run scripts/05_scalability_depth.ts --network localhost
 ```
 
 # Repo tham khảo
