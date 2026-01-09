@@ -83,6 +83,10 @@ npx hardhat run scripts/04_measure_gas.ts --network localhost
 ```bash
 npx hardhat run scripts/05_scalability_depth.ts --network localhost
 ```
+# 6)Latency, Throughput & Sensitivity analysis
+```bash
+npx hardhat run scripts/06_benchmarks.ts --network localhost
+```
 
 # Repo tham khảo
 https://github.com/cjxe/on-chain-dex?tab=readme-ov-file
